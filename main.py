@@ -75,8 +75,9 @@ def _jina_content(text: str) -> str:
 
 def _smart_slice(text: str) -> tuple[str, str]:
     """
-    Skip the Jina metadata header, then find the first two date-headings
-    and return (date_string, body_between_them).
+    Skip the Jina metadata header, then find the first two date-headings.
+    Returns (date_string, body) where body *includes* the heading line so
+    the rendered email starts with the ### Date heading, not a floating paragraph.
     Returns ("", "") if no date headings are found.
     """
     content = _jina_content(text)
@@ -87,7 +88,7 @@ def _smart_slice(text: str) -> tuple[str, str]:
 
     first = matches[0]
     date_str = first.group(0).lstrip("#").strip()
-    start = first.end()
+    start = first.start()   # include the heading itself in the body
     end = matches[1].start() if len(matches) > 1 else len(content)
 
     body = content[start:end].strip()
@@ -98,18 +99,21 @@ def _smart_slice(text: str) -> tuple[str, str]:
 # Site-specific parsers
 # ---------------------------------------------------------------------------
 
+def _fix_relative_links(body: str, base_url: str) -> str:
+    """
+    Convert any markdown link whose target starts with '/' into an absolute URL.
+    e.g. ](/docs/foo)  →  ](https://platform.claude.com/docs/foo)
+         ](/en/articles/bar) → ](https://help.openai.com/en/articles/bar)
+    """
+    return re.sub(r"\]\(/", f"]({base_url}/", body)
+
+
 def parse_claude(text: str) -> dict:
     date_str, body = _smart_slice(text)
     if not date_str:
         return _fallback(text)
 
-    # Make relative Anthropic doc links absolute so they work in email
-    body = re.sub(
-        r"\]\(/docs/",
-        r"](https://platform.claude.com/docs/",
-        body,
-    )
-
+    body = _fix_relative_links(body, "https://platform.claude.com")
     return {"date": date_str, "title": date_str, "body": body[:3000]}
 
 
@@ -118,6 +122,7 @@ def parse_openai(text: str) -> dict:
     if not date_str:
         return _fallback(text)
 
+    body = _fix_relative_links(body, "https://help.openai.com")
     return {"date": date_str, "title": date_str, "body": body[:3000]}
 
 
@@ -162,19 +167,22 @@ def compute_hash(date: str, title: str, body: str) -> str:
 
 def _apply_inline_styles(html: str) -> str:
     """
-    Replace every HTML tag produced by the markdown library with an
-    equivalent tag carrying explicit inline styles.  No class names,
-    no <style> block — Gmail renders all of this correctly.
+    Replace every HTML tag produced by the markdown library with an equivalent
+    tag carrying explicit inline styles.  No class names, no <style> block —
+    Gmail renders all of this correctly across all clients and platforms.
+
+    h1/h2/h3 use progressively lighter colours so the date heading (###) reads
+    as a clear sub-title beneath the masthead source name.
     """
     replacements = [
-        ("<h1>", '<h1 style="margin:0 0 14px 0;font-size:20px;font-weight:700;color:#f5f5f7;line-height:1.3;">'),
-        ("<h2>", '<h2 style="margin:20px 0 8px 0;font-size:17px;font-weight:600;color:#f5f5f7;line-height:1.4;">'),
-        ("<h3>", '<h3 style="margin:16px 0 6px 0;font-size:14px;font-weight:600;color:#aeaeb2;text-transform:uppercase;letter-spacing:0.3px;line-height:1.4;">'),
+        ("<h1>", '<h1 style="margin:0 0 14px 0;font-size:22px;font-weight:700;color:#f5f5f7;line-height:1.3;">'),
+        ("<h2>", '<h2 style="margin:18px 0 8px 0;font-size:18px;font-weight:600;color:#f5f5f7;line-height:1.4;">'),
+        ("<h3>", '<h3 style="margin:0 0 16px 0;font-size:20px;font-weight:700;color:#f5f5f7;line-height:1.3;border-bottom:1px solid #3a3a3c;padding-bottom:10px;">'),
         ("<h4>", '<h4 style="margin:14px 0 5px 0;font-size:13px;font-weight:600;color:#aeaeb2;line-height:1.4;">'),
         ("<p>",  '<p style="margin:0 0 12px 0;font-size:15px;color:#ebebf0;line-height:1.65;">'),
-        ("<ul>", '<ul style="margin:0 0 12px 0;padding-left:22px;color:#ebebf0;">'),
-        ("<ol>", '<ol style="margin:0 0 12px 0;padding-left:22px;color:#ebebf0;">'),
-        ("<li>", '<li style="margin-bottom:7px;font-size:15px;line-height:1.65;color:#ebebf0;">'),
+        ("<ul>", '<ul style="margin:0 0 14px 0;padding-left:22px;color:#ebebf0;">'),
+        ("<ol>", '<ol style="margin:0 0 14px 0;padding-left:22px;color:#ebebf0;">'),
+        ("<li>", '<li style="margin-bottom:8px;font-size:15px;line-height:1.65;color:#ebebf0;">'),
         ("<a ",  '<a style="color:#2997ff;text-decoration:none;" '),
         ("<code>", '<code style="background-color:#2c2c2e;color:#e5e5ea;padding:2px 6px;border-radius:4px;font-size:13px;font-family:\'SF Mono\',Menlo,Consolas,monospace;">'),
         ("<pre>",  '<pre style="background-color:#2c2c2e;color:#e5e5ea;padding:14px 16px;border-radius:8px;font-size:13px;font-family:\'SF Mono\',Menlo,Consolas,monospace;margin:0 0 14px 0;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word;">'),
@@ -190,57 +198,101 @@ def _apply_inline_styles(html: str) -> str:
 
 
 def build_email_html(source_name: str, update: dict) -> str:
+    """
+    Build a fully inline-CSS HTML email safe for Gmail on all platforms.
+
+    Layout
+    ──────
+    [masthead]  branded header: AI SENTINEL pill + source name
+    [card]      rendered Markdown body, which now starts with the ### Date
+                heading so the content is properly anchored
+    [footer]
+    """
     raw_html = md_lib.markdown(update["body"], extensions=["extra", "sane_lists"])
     body_html = _apply_inline_styles(raw_html)
-    date = update["date"]
+
+    # colour-scheme hints stop iOS Gmail auto-inverting the dark background
+    head = (
+        '<head>'
+        '<meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+        '<meta name="color-scheme" content="light dark">'
+        '<meta name="supported-color-schemes" content="light dark">'
+        '</head>'
+    )
+
+    # masthead — always light text on dark, explicit hex so Gmail can't guess wrong
+    masthead = (
+        '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+        ' style="background-color:#000000;">'
+        '<tr><td style="padding:28px 24px 20px 24px;">'
+
+        # AI SENTINEL pill badge
+        '<div style="display:inline-block;background-color:#0071e3;color:#ffffff;'
+        'font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;'
+        'padding:5px 14px;border-radius:20px;margin-bottom:14px;">'
+        'AI&nbsp;SENTINEL'
+        '</div>'
+
+        # source name (the "newsletter title")
+        f'<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
+        f'Roboto,\'Helvetica Neue\',Arial,sans-serif;font-size:28px;font-weight:700;'
+        f'color:#f5f5f7;line-height:1.2;letter-spacing:-0.3px;">{source_name}</div>'
+
+        # thin divider
+        '<div style="margin-top:18px;height:1px;background-color:#3a3a3c;"></div>'
+
+        '</td></tr>'
+        '</table>'
+    )
+
+    # content card — explicit background + text colours on every wrapper
+    card = (
+        '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+        ' style="background-color:#1c1c1e;">'
+        '<tr><td style="padding:24px 24px 32px 24px;background-color:#1c1c1e;'
+        'color:#ebebf0;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
+        'Roboto,\'Helvetica Neue\',Arial,sans-serif;font-size:15px;line-height:1.65;">'
+        f'{body_html}'
+        '</td></tr>'
+        '</table>'
+    )
+
+    footer = (
+        '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+        ' style="background-color:#000000;">'
+        '<tr><td style="padding:16px 24px 28px 24px;text-align:center;'
+        'color:#636366;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
+        'Roboto,\'Helvetica Neue\',Arial,sans-serif;font-size:11px;letter-spacing:0.2px;">'
+        'AI Release Notes Sentinel &mdash; checking every 4 hours'
+        '</td></tr>'
+        '</table>'
+    )
 
     return (
         '<!DOCTYPE html>'
         '<html lang="en">'
-        '<head><meta charset="UTF-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
-        '</head>'
+        + head +
         '<body style="margin:0;padding:0;background-color:#000000;'
-        'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,'
-        '\'Helvetica Neue\',Arial,sans-serif;-webkit-text-size-adjust:100%;">'
-
-        # outer wrapper
-        '<div style="background-color:#000000;padding:28px 16px;">'
-        '<div style="max-width:600px;margin:0 auto;">'
-
-        # badge
-        '<div style="display:inline-block;background:#0071e3;color:#ffffff;'
-        'font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;'
-        'padding:5px 14px;border-radius:20px;margin-bottom:16px;">'
-        'AI SENTINEL'
-        '</div>'
-
-        # card
-        '<div style="background-color:#1c1c1e;border-radius:16px;overflow:hidden;">'
-
-        # card header
-        '<div style="padding:24px 24px 18px 24px;border-bottom:1px solid #3a3a3c;">'
-        f'<p style="margin:0 0 5px 0;font-size:11px;font-weight:600;color:#8e8e93;'
-        f'letter-spacing:0.4px;text-transform:uppercase;">{source_name}</p>'
-        f'<h1 style="margin:0;font-size:26px;font-weight:700;color:#f5f5f7;line-height:1.25;">'
-        f'{date}'
-        f'</h1>'
-        '</div>'
-
-        # card body
-        f'<div style="padding:20px 24px 28px 24px;color:#ebebf0;font-size:15px;line-height:1.65;">'
-        f'{body_html}'
-        '</div>'
-
-        '</div>'  # /card
-
-        # footer
-        '<p style="margin:14px 0 0 0;text-align:center;color:#636366;font-size:11px;'
-        'letter-spacing:0.2px;">AI Release Notes Sentinel &mdash; checking every 4 hours</p>'
-
-        '</div>'  # /inner
-        '</div>'  # /outer
-
+        '-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">'
+        '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+        ' style="background-color:#000000;">'
+        '<tr><td align="center" style="padding:0;">'
+        '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+        ' style="max-width:600px;margin:0 auto;background-color:#000000;">'
+        '<tr><td>'
+        + masthead
+        + '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+        ' style="background-color:#1c1c1e;border-radius:0 0 16px 16px;overflow:hidden;">'
+        '<tr><td>'
+        + card
+        + '</td></tr>'
+        '</table>'
+        + footer +
+        '</td></tr>'
+        '</table>'
+        '</td></tr>'
+        '</table>'
         '</body></html>'
     )
 
