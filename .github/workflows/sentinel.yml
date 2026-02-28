@@ -1,6 +1,10 @@
 name: AI Release Notes Sentinel
 
 on:
+  push:
+    branches:
+      - main
+      - "claude/*"
   schedule:
     - cron: "0 */4 * * *"
   workflow_dispatch:
