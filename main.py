@@ -42,19 +42,56 @@ HEADERS = {
     )
 }
 
-# Month names for date pattern matching
-_MONTH = (
+# ---------------------------------------------------------------------------
+# Smart-slice helpers
+# ---------------------------------------------------------------------------
+
+# Matches any markdown heading line (##, ###, ####) that contains a month name
+# and a 4-digit year — e.g. "### February 25, 2026" or "## February 2026"
+_DATE_HEADING = re.compile(
+    r"^#{1,4}\s+[^\n]*"
     r"(?:January|February|March|April|May|June|July|August"
     r"|September|October|November|December)"
-)
-
-# Matches lines like: "### February 19, 2026" or "## February 2026" or "**February 19, 2026**"
-_DATE_LINE = re.compile(
-    r"^(?:#{1,3}\s+|\*{1,2}\s*)("
-    + _MONTH
-    + r"[^\n]{0,60}20\d{2}[^\n]{0,20})\*{0,2}[ \t]*$",
+    r"[^\n]*20\d{2}[^\n]*$",
     re.MULTILINE | re.IGNORECASE,
 )
+
+# Jina Reader always ends its metadata block with a line of ≥10 '=' chars.
+# Matching past it gives us the clean page markdown, skipping Published Time etc.
+_JINA_SEP = re.compile(r"={10,}[ \t]*[\r\n]+", re.MULTILINE)
+
+
+def _jina_content(text: str) -> str:
+    """
+    Strip Jina's injected metadata header (Title / URL Source / Published Time).
+    Jina always ends its header with a line of '===...===' separators.
+    Falls back to skipping the first 500 chars if the separator is absent.
+    """
+    m = _JINA_SEP.search(text)
+    if m:
+        return text[m.end():]
+    return text[500:]
+
+
+def _smart_slice(text: str) -> tuple[str, str]:
+    """
+    Skip the Jina metadata header, then find the first two date-headings
+    and return (date_string, body_between_them).
+    Returns ("", "") if no date headings are found.
+    """
+    content = _jina_content(text)
+
+    matches = list(_DATE_HEADING.finditer(content))
+    if not matches:
+        return "", ""
+
+    first = matches[0]
+    date_str = first.group(0).lstrip("#").strip()
+    start = first.end()
+    end = matches[1].start() if len(matches) > 1 else len(content)
+
+    body = content[start:end].strip()
+    return date_str, body
 
 
 # ---------------------------------------------------------------------------
@@ -62,31 +99,9 @@ _DATE_LINE = re.compile(
 # ---------------------------------------------------------------------------
 
 def parse_claude(text: str) -> dict:
-    """
-    Claude release notes format (platform.claude.com):
-        ### February 19, 2026
-        - Bullet one
-        - Bullet two
-
-        ### February 17, 2026
-        ...
-    """
-    # Find all ### Date headers
-    pattern = re.compile(
-        r"^###\s+("
-        + _MONTH
-        + r"[^\n]{0,60}20\d{2}[^\n]{0,30})[ \t]*$",
-        re.MULTILINE | re.IGNORECASE,
-    )
-    matches = list(pattern.finditer(text))
-    if not matches:
+    date_str, body = _smart_slice(text)
+    if not date_str:
         return _fallback(text)
-
-    first = matches[0]
-    date_str = first.group(1).strip()
-    start = first.end()
-    end = matches[1].start() if len(matches) > 1 else len(text)
-    body = text[start:end].strip()
 
     # Make relative Anthropic doc links absolute so they work in email
     body = re.sub(
@@ -99,69 +114,11 @@ def parse_claude(text: str) -> dict:
 
 
 def parse_openai(text: str) -> dict:
-    """
-    OpenAI Help Center articles (via Jina Reader).
-    Tries several date-header formats in order:
-      1.  ### Specific Date, Year   (h3 with full date)
-      2.  ## Month YYYY             (h2 month section)
-      3.  **Date**                  (bold date)
-    """
-    # --- Strategy 1: ### Full date (e.g. "### February 20, 2026") ---
-    h3_date = re.compile(
-        r"^###\s+("
-        + _MONTH
-        + r"[^\n]{0,60}20\d{2}[^\n]{0,30})[ \t]*$",
-        re.MULTILINE | re.IGNORECASE,
-    )
-    matches = list(h3_date.finditer(text))
-    if matches:
-        first = matches[0]
-        date_str = first.group(1).strip()
-        start = first.end()
-        end = matches[1].start() if len(matches) > 1 else len(text)
-        body = text[start:end].strip()
-        return {"date": date_str, "title": date_str, "body": body[:3000]}
+    date_str, body = _smart_slice(text)
+    if not date_str:
+        return _fallback(text)
 
-    # --- Strategy 2: ## Month YYYY (e.g. "## February 2026") ---
-    h2_month = re.compile(
-        r"^##\s+(" + _MONTH + r"\s+20\d{2})[ \t]*$",
-        re.MULTILINE | re.IGNORECASE,
-    )
-    matches = list(h2_month.finditer(text))
-    if matches:
-        first = matches[0]
-        date_str = first.group(1).strip()
-        start = first.end()
-        end = matches[1].start() if len(matches) > 1 else len(text)
-        body = text[start:end].strip()
-        return {"date": date_str, "title": date_str, "body": body[:3000]}
-
-    # --- Strategy 3: **Date** bold header ---
-    bold_date = re.compile(
-        r"\*\*("
-        + _MONTH
-        + r"[^*]{0,60}20\d{2}[^*]{0,20})\*\*[ \t]*\n([\s\S]*?)(?=\n\*\*"
-        + _MONTH
-        + r"|\Z)",
-        re.IGNORECASE,
-    )
-    m = bold_date.search(text)
-    if m:
-        date_str = m.group(1).strip()
-        body = m.group(2).strip()
-        return {"date": date_str, "title": date_str, "body": body[:3000]}
-
-    # --- Strategy 4: Generic date line (any heading level) ---
-    matches = list(_DATE_LINE.finditer(text))
-    if matches:
-        first = matches[0]
-        date_str = first.group(1).strip()
-        start = first.end()
-        end = matches[1].start() if len(matches) > 1 else len(text)
-        body = text[start:end].strip()
-        return {"date": date_str, "title": date_str, "body": body[:3000]}
-
-    return _fallback(text)
+    return {"date": date_str, "title": date_str, "body": body[:3000]}
 
 
 def _fallback(text: str) -> dict:
@@ -200,156 +157,92 @@ def compute_hash(date: str, title: str, body: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Email builder
+# Email builder — inline CSS only (Gmail-safe)
 # ---------------------------------------------------------------------------
 
-def _style_markdown_html(raw_html: str) -> str:
-    """Inject inline styles onto tags produced by the markdown library."""
+def _apply_inline_styles(html: str) -> str:
+    """
+    Replace every HTML tag produced by the markdown library with an
+    equivalent tag carrying explicit inline styles.  No class names,
+    no <style> block — Gmail renders all of this correctly.
+    """
     replacements = [
-        # headings
-        ("<h1>", '<h1 style="margin:0 0 12px;font-size:22px;font-weight:700;color:#f5f5f7;line-height:1.3;">'),
-        ("<h2>", '<h2 style="margin:20px 0 8px;font-size:18px;font-weight:600;color:#f5f5f7;line-height:1.4;">'),
-        ("<h3>", '<h3 style="margin:16px 0 6px;font-size:15px;font-weight:600;color:#d1d1d6;line-height:1.4;">'),
-        # paragraphs
-        ("<p>",  '<p style="margin:0 0 12px;color:#ebebf0;font-size:15px;line-height:1.65;">'),
-        # lists
-        ("<ul>", '<ul style="margin:0 0 12px;padding-left:20px;color:#ebebf0;">'),
-        ("<ol>", '<ol style="margin:0 0 12px;padding-left:20px;color:#ebebf0;">'),
-        ("<li>", '<li style="margin-bottom:6px;font-size:15px;line-height:1.65;">'),
-        # links
+        ("<h1>", '<h1 style="margin:0 0 14px 0;font-size:20px;font-weight:700;color:#f5f5f7;line-height:1.3;">'),
+        ("<h2>", '<h2 style="margin:20px 0 8px 0;font-size:17px;font-weight:600;color:#f5f5f7;line-height:1.4;">'),
+        ("<h3>", '<h3 style="margin:16px 0 6px 0;font-size:14px;font-weight:600;color:#aeaeb2;text-transform:uppercase;letter-spacing:0.3px;line-height:1.4;">'),
+        ("<h4>", '<h4 style="margin:14px 0 5px 0;font-size:13px;font-weight:600;color:#aeaeb2;line-height:1.4;">'),
+        ("<p>",  '<p style="margin:0 0 12px 0;font-size:15px;color:#ebebf0;line-height:1.65;">'),
+        ("<ul>", '<ul style="margin:0 0 12px 0;padding-left:22px;color:#ebebf0;">'),
+        ("<ol>", '<ol style="margin:0 0 12px 0;padding-left:22px;color:#ebebf0;">'),
+        ("<li>", '<li style="margin-bottom:7px;font-size:15px;line-height:1.65;color:#ebebf0;">'),
         ("<a ",  '<a style="color:#2997ff;text-decoration:none;" '),
-        # code
-        ("<code>", '<code style="background:#2c2c2e;color:#e5e5ea;padding:2px 6px;border-radius:4px;font-size:13px;font-family:\'SF Mono\',Menlo,monospace;">'),
-        ("<pre>",  '<pre style="background:#2c2c2e;color:#e5e5ea;padding:12px;border-radius:8px;overflow-x:auto;font-size:13px;font-family:\'SF Mono\',Menlo,monospace;margin:0 0 12px;">'),
-        # strong / em
-        ("<strong>", '<strong style="color:#f5f5f7;font-weight:600;">'),
-        ("<em>",     '<em style="color:#d1d1d6;">'),
-        # horizontal rule
-        ("<hr />", '<hr style="border:none;border-top:1px solid #3a3a3c;margin:16px 0;" />'),
+        ("<code>", '<code style="background-color:#2c2c2e;color:#e5e5ea;padding:2px 6px;border-radius:4px;font-size:13px;font-family:\'SF Mono\',Menlo,Consolas,monospace;">'),
+        ("<pre>",  '<pre style="background-color:#2c2c2e;color:#e5e5ea;padding:14px 16px;border-radius:8px;font-size:13px;font-family:\'SF Mono\',Menlo,Consolas,monospace;margin:0 0 14px 0;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word;">'),
+        ("<strong>", '<strong style="font-weight:600;color:#f5f5f7;">'),
+        ("<em>",     '<em style="color:#d1d1d6;font-style:italic;">'),
+        ("<blockquote>", '<blockquote style="margin:0 0 12px 0;padding:10px 14px;border-left:3px solid #3a3a3c;color:#aeaeb2;font-style:italic;">'),
+        ("<hr />",  '<hr style="border:none;border-top:1px solid #3a3a3c;margin:16px 0;" />'),
+        ("<hr>",    '<hr style="border:none;border-top:1px solid #3a3a3c;margin:16px 0;" />'),
     ]
     for old, new in replacements:
-        raw_html = raw_html.replace(old, new)
-    return raw_html
+        html = html.replace(old, new)
+    return html
 
 
 def build_email_html(source_name: str, update: dict) -> str:
-    raw_md = update["body"]
-    raw_html = md_lib.markdown(raw_md, extensions=["extra", "sane_lists"])
-    body_html = _style_markdown_html(raw_html)
+    raw_html = md_lib.markdown(update["body"], extensions=["extra", "sane_lists"])
+    body_html = _apply_inline_styles(raw_html)
     date = update["date"]
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body {{
-      margin: 0; padding: 0;
-      background-color: #000000;
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
-                   "Helvetica Neue", Helvetica, Arial, sans-serif;
-      -webkit-text-size-adjust: 100%;
-    }}
-    .outer {{
-      background-color: #000000;
-      padding: 28px 16px;
-    }}
-    .inner {{
-      max-width: 600px;
-      margin: 0 auto;
-    }}
-    .badge {{
-      display: inline-block;
-      background: linear-gradient(135deg, #0071e3 0%, #34aadc 100%);
-      color: #ffffff;
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 1px;
-      text-transform: uppercase;
-      padding: 5px 13px;
-      border-radius: 20px;
-      margin-bottom: 14px;
-    }}
-    .card {{
-      background-color: #1c1c1e;
-      border-radius: 16px;
-      overflow: hidden;
-    }}
-    .card-header {{
-      padding: 24px 24px 18px;
-      border-bottom: 1px solid #3a3a3c;
-    }}
-    .source-label {{
-      margin: 0 0 5px;
-      font-size: 11px;
-      font-weight: 600;
-      color: #8e8e93;
-      letter-spacing: 0.4px;
-      text-transform: uppercase;
-    }}
-    .date-title {{
-      margin: 0;
-      font-size: 24px;
-      font-weight: 700;
-      color: #f5f5f7;
-      line-height: 1.25;
-    }}
-    .card-body {{
-      padding: 20px 24px 24px;
-      color: #ebebf0;
-      font-size: 15px;
-      line-height: 1.65;
-    }}
-    .card-body h1 {{ margin: 0 0 12px; font-size: 20px; font-weight: 700; color: #f5f5f7; }}
-    .card-body h2 {{ margin: 20px 0 8px; font-size: 17px; font-weight: 600; color: #f5f5f7; }}
-    .card-body h3 {{ margin: 16px 0 6px; font-size: 14px; font-weight: 600; color: #aeaeb2; text-transform: uppercase; letter-spacing: 0.3px; }}
-    .card-body p  {{ margin: 0 0 12px; }}
-    .card-body ul, .card-body ol {{ margin: 0 0 12px; padding-left: 20px; }}
-    .card-body li {{ margin-bottom: 7px; }}
-    .card-body a  {{ color: #2997ff; text-decoration: none; }}
-    .card-body a:hover {{ text-decoration: underline; }}
-    .card-body code {{
-      background: #2c2c2e; color: #e5e5ea;
-      padding: 2px 6px; border-radius: 4px;
-      font-size: 13px; font-family: "SF Mono", Menlo, monospace;
-    }}
-    .card-body pre {{
-      background: #2c2c2e; color: #e5e5ea;
-      padding: 14px; border-radius: 10px;
-      overflow-x: auto; font-size: 13px;
-      font-family: "SF Mono", Menlo, monospace;
-      margin: 0 0 12px;
-    }}
-    .card-body strong {{ color: #f5f5f7; font-weight: 600; }}
-    .card-body hr {{ border: none; border-top: 1px solid #3a3a3c; margin: 16px 0; }}
-    .footer {{
-      padding: 14px 8px 0;
-      text-align: center;
-      color: #636366;
-      font-size: 11px;
-      letter-spacing: 0.2px;
-    }}
-  </style>
-</head>
-<body>
-<div class="outer">
-  <div class="inner">
-    <div class="badge">AI Sentinel</div>
-    <div class="card">
-      <div class="card-header">
-        <p class="source-label">{source_name}</p>
-        <h1 class="date-title">{date}</h1>
-      </div>
-      <div class="card-body">
-        {body_html}
-      </div>
-    </div>
-    <div class="footer">AI Release Notes Sentinel &mdash; checking every 4 hours</div>
-  </div>
-</div>
-</body>
-</html>"""
+    return (
+        '<!DOCTYPE html>'
+        '<html lang="en">'
+        '<head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+        '</head>'
+        '<body style="margin:0;padding:0;background-color:#000000;'
+        'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,'
+        '\'Helvetica Neue\',Arial,sans-serif;-webkit-text-size-adjust:100%;">'
+
+        # outer wrapper
+        '<div style="background-color:#000000;padding:28px 16px;">'
+        '<div style="max-width:600px;margin:0 auto;">'
+
+        # badge
+        '<div style="display:inline-block;background:#0071e3;color:#ffffff;'
+        'font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;'
+        'padding:5px 14px;border-radius:20px;margin-bottom:16px;">'
+        'AI SENTINEL'
+        '</div>'
+
+        # card
+        '<div style="background-color:#1c1c1e;border-radius:16px;overflow:hidden;">'
+
+        # card header
+        '<div style="padding:24px 24px 18px 24px;border-bottom:1px solid #3a3a3c;">'
+        f'<p style="margin:0 0 5px 0;font-size:11px;font-weight:600;color:#8e8e93;'
+        f'letter-spacing:0.4px;text-transform:uppercase;">{source_name}</p>'
+        f'<h1 style="margin:0;font-size:26px;font-weight:700;color:#f5f5f7;line-height:1.25;">'
+        f'{date}'
+        f'</h1>'
+        '</div>'
+
+        # card body
+        f'<div style="padding:20px 24px 28px 24px;color:#ebebf0;font-size:15px;line-height:1.65;">'
+        f'{body_html}'
+        '</div>'
+
+        '</div>'  # /card
+
+        # footer
+        '<p style="margin:14px 0 0 0;text-align:center;color:#636366;font-size:11px;'
+        'letter-spacing:0.2px;">AI Release Notes Sentinel &mdash; checking every 4 hours</p>'
+
+        '</div>'  # /inner
+        '</div>'  # /outer
+
+        '</body></html>'
+    )
 
 
 # ---------------------------------------------------------------------------
