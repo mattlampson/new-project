@@ -49,12 +49,6 @@ _MONTH = (
 )
 
 # Matches lines like: "### February 19, 2026" or "## February 2026" or "**February 19, 2026**"
-_DATE_LINE_RE = re.compile(
-    rf"^({{{{1,3}}}}\s+|[ \t]*\*{{{{1,2}}}}\s*)({_MONTH}[^\n]{{{{0,60}}}}20\d{{{{2}}}}[^\n]{{{{0,20}}}})(\*{{{{0,2}}}})[ \t]*$".format().replace("{{{{", "{").replace("}}}}", "}"),
-    re.MULTILINE | re.IGNORECASE,
-)
-
-# Simpler, more readable version of the same pattern
 _DATE_LINE = re.compile(
     r"^(?:#{1,3}\s+|\*{1,2}\s*)("
     + _MONTH
