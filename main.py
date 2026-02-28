@@ -1,14 +1,22 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import smtplib
-import sys
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import markdown as md_lib
 import requests
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-8s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Sources
@@ -157,8 +165,9 @@ def save_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def compute_hash(date: str, title: str, body: str) -> str:
-    return hashlib.md5(f"{date}|{title}|{body}".encode()).hexdigest()
+def compute_hash(date: str, title: str) -> str:
+    """Hash only date+title so body typo-fixes never re-trigger an alert."""
+    return hashlib.md5(f"{date}|{title}".encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +315,7 @@ def send_email(source_name: str, update: dict) -> None:
     gmail_password = os.environ.get("GMAIL_APP_PASSWORD")
 
     if not gmail_user or not gmail_password:
-        print("ERROR: GMAIL_USER or GMAIL_APP_PASSWORD not set.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("GMAIL_USER or GMAIL_APP_PASSWORD env vars are not set")
 
     subject = f"[AI SENTINEL] New Update: {source_name}"
     html = build_email_html(source_name, update)
@@ -324,17 +332,33 @@ def send_email(source_name: str, update: dict) -> None:
         server.login(gmail_user, gmail_password)
         server.sendmail(gmail_user, RECIPIENT, msg.as_string())
 
-    print(f"  ✓ Email sent for: {source_name}")
+    log.info("Email sent for: %s", source_name)
 
 
 # ---------------------------------------------------------------------------
-# HTTP fetch
+# HTTP fetch  (3-attempt retry, 5 s between attempts)
 # ---------------------------------------------------------------------------
+
+_RETRY_ATTEMPTS = 3
+_RETRY_DELAY    = 5  # seconds
+
 
 def fetch_content(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _RETRY_ATTEMPTS:
+                log.warning(
+                    "Fetch attempt %d/%d failed (%s) — retrying in %ds",
+                    attempt, _RETRY_ATTEMPTS, exc, _RETRY_DELAY,
+                )
+                time.sleep(_RETRY_DELAY)
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -342,52 +366,45 @@ def fetch_content(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    log.info("AI Sentinel starting — checking %d source(s)", len(SOURCES))
     state = load_state()
     state_changed = False
 
     for source in SOURCES:
-        name = source["name"]
-        url = source["url"]
+        name       = source["name"]
+        url        = source["url"]
         parser_key = source["parser"]
-        print(f"\nChecking: {name}")
+        log.info("Checking: %s", name)
 
         try:
-            content = fetch_content(url)
-        except Exception as e:
-            print(f"  ✗ Fetch error: {e}", file=sys.stderr)
-            continue
+            content  = fetch_content(url)
+            update   = PARSERS[parser_key](content)
 
-        parse_fn = PARSERS[parser_key]
-        try:
-            update = parse_fn(content)
-        except Exception as e:
-            print(f"  ✗ Parse error: {e}", file=sys.stderr)
-            continue
+            log.info("  Extracted date : %s", update["date"])
+            log.info("  Body preview   : %.80s", update["body"].strip())
 
-        print(f"  → Date : {update['date']}")
-        print(f"  → Body : {update['body'][:80].strip()!r}…")
+            current_hash = compute_hash(update["date"], update["title"])
+            stored_hash  = state.get(name)
 
-        current_hash = compute_hash(update["date"], update["title"], update["body"])
-        stored_hash = state.get(name)
+            if stored_hash == current_hash:
+                log.info("  No change detected.")
+                continue
 
-        if stored_hash == current_hash:
-            print("  → No change detected.")
-            continue
-
-        print("  → Change detected — sending alert email.")
-        state[name] = current_hash
-        state_changed = True
-
-        try:
+            log.info("  Change detected — sending alert email.")
+            state[name]   = current_hash
+            state_changed = True
             send_email(name, update)
-        except Exception as e:
-            print(f"  ✗ Email error: {e}", file=sys.stderr)
+
+        except Exception as exc:
+            # Log and continue — one broken source must never block the others
+            log.error("  Failed to process '%s': %s", name, exc, exc_info=True)
+            continue
 
     if state_changed:
         save_state(state)
-        print("\nState updated and saved.")
+        log.info("State updated and saved.")
     else:
-        print("\nAll sources up to date. No emails sent.")
+        log.info("All sources up to date. No emails sent.")
 
 
 if __name__ == "__main__":
