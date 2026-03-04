@@ -1,14 +1,12 @@
-import hashlib
 import json
 import logging
 import os
-import re
 import smtplib
 import time
+import xml.etree.ElementTree as ET
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import markdown as md_lib
 import requests
 
 logging.basicConfig(
@@ -19,131 +17,102 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Sources
+# Sources — pure RSS feeds, no scraping
 # ---------------------------------------------------------------------------
 
 SOURCES = [
     {
         "name": "ChatGPT Release Notes",
-        "url": "https://r.jina.ai/https://help.openai.com/en/articles/6825453-chatgpt-release-notes",
-        "parser": "openai",
+        "url": "https://rsshub.app/openai/chatgpt/release-notes",
     },
     {
-        "name": "OpenAI Model Release Notes",
-        "url": "https://r.jina.ai/https://help.openai.com/en/articles/9624314-model-release-notes",
-        "parser": "openai",
+        "name": "OpenAI Developer Changelog",
+        "url": "https://developers.openai.com/changelog/rss.xml",
     },
     {
-        "name": "Claude Release Notes",
-        "url": "https://r.jina.ai/https://platform.claude.com/docs/en/release-notes/overview",
-        "parser": "claude",
+        "name": "OpenAI News",
+        "url": "https://openai.com/news/rss.xml",
     },
 ]
 
 STATE_FILE = "state.json"
 RECIPIENT = "lampsonmatt@gmail.com"
+MAX_STORED_GUIDS = 200
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (compatible; AISentinel/2.0; "
+        "+https://github.com/mattlampson/new-project)"
     )
 }
 
-# ---------------------------------------------------------------------------
-# Smart-slice helpers
-# ---------------------------------------------------------------------------
-
-# Matches any markdown heading line (##, ###, ####) that contains a month name
-# and a 4-digit year — e.g. "### February 25, 2026" or "## February 2026"
-_DATE_HEADING = re.compile(
-    r"^#{1,4}\s+[^\n]*"
-    r"(?:January|February|March|April|May|June|July|August"
-    r"|September|October|November|December)"
-    r"[^\n]*20\d{2}[^\n]*$",
-    re.MULTILINE | re.IGNORECASE,
-)
-
-# Jina Reader always ends its metadata block with a line of ≥10 '=' chars.
-# Matching past it gives us the clean page markdown, skipping Published Time etc.
-_JINA_SEP = re.compile(r"={10,}[ \t]*[\r\n]+", re.MULTILINE)
-
-
-def _jina_content(text: str) -> str:
-    """
-    Strip Jina's injected metadata header (Title / URL Source / Published Time).
-    Jina always ends its header with a line of '===...===' separators.
-    Falls back to skipping the first 500 chars if the separator is absent.
-    """
-    m = _JINA_SEP.search(text)
-    if m:
-        return text[m.end():]
-    return text[500:]
-
-
-def _smart_slice(text: str) -> tuple[str, str]:
-    """
-    Skip the Jina metadata header, then find the first two date-headings.
-    Returns (date_string, body) where body *includes* the heading line so
-    the rendered email starts with the ### Date heading, not a floating paragraph.
-    Returns ("", "") if no date headings are found.
-    """
-    content = _jina_content(text)
-
-    matches = list(_DATE_HEADING.finditer(content))
-    if not matches:
-        return "", ""
-
-    first = matches[0]
-    date_str = first.group(0).lstrip("#").strip()
-    start = first.start()   # include the heading itself in the body
-    end = matches[1].start() if len(matches) > 1 else len(content)
-
-    body = content[start:end].strip()
-    return date_str, body
-
-
-# ---------------------------------------------------------------------------
-# Site-specific parsers
-# ---------------------------------------------------------------------------
-
-def _fix_relative_links(body: str, base_url: str) -> str:
-    """
-    Convert any markdown link whose target starts with '/' into an absolute URL.
-    e.g. ](/docs/foo)  →  ](https://platform.claude.com/docs/foo)
-         ](/en/articles/bar) → ](https://help.openai.com/en/articles/bar)
-    """
-    return re.sub(r"\]\(/", f"]({base_url}/", body)
-
-
-def parse_claude(text: str) -> dict:
-    date_str, body = _smart_slice(text)
-    if not date_str:
-        return _fallback(text)
-
-    body = _fix_relative_links(body, "https://platform.claude.com")
-    return {"date": date_str, "title": date_str, "body": body[:3000]}
-
-
-def parse_openai(text: str) -> dict:
-    date_str, body = _smart_slice(text)
-    if not date_str:
-        return _fallback(text)
-
-    body = _fix_relative_links(body, "https://help.openai.com")
-    return {"date": date_str, "title": date_str, "body": body[:3000]}
-
-
-def _fallback(text: str) -> dict:
-    """Last-resort: grab first 500 chars as body."""
-    snippet = text.strip()[:500]
-    return {"date": "Latest Update", "title": "Latest Update", "body": snippet}
-
-
-PARSERS = {
-    "claude": parse_claude,
-    "openai": parse_openai,
+# Namespace map for Atom feeds
+_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "content": "http://purl.org/rss/1.0/modules/content/",
 }
+
+
+# ---------------------------------------------------------------------------
+# RSS / Atom parser
+# ---------------------------------------------------------------------------
+
+def _parse_rss_items(root: ET.Element) -> list[dict]:
+    """Parse RSS 2.0 <channel><item> elements."""
+    items = []
+    for item in root.iter("item"):
+        guid_el = item.find("guid")
+        link_el = item.find("link")
+        items.append({
+            "guid": guid_el.text.strip() if guid_el is not None and guid_el.text else
+                    (link_el.text.strip() if link_el is not None and link_el.text else ""),
+            "title": (item.findtext("title") or "").strip(),
+            "link": (link_el.text.strip() if link_el is not None and link_el.text else ""),
+            "published": (item.findtext("pubDate") or "").strip(),
+            "body": (item.findtext("content:encoded", namespaces=_NS)
+                     or item.findtext("description") or "").strip(),
+        })
+    return items
+
+
+def _parse_atom_entries(root: ET.Element) -> list[dict]:
+    """Parse Atom <feed><entry> elements."""
+    ns = _NS["atom"]
+    items = []
+    for entry in root.findall(f"{{{ns}}}entry"):
+        id_el = entry.find(f"{{{ns}}}id")
+        link_el = entry.find(f"{{{ns}}}link")
+        link_href = link_el.get("href", "") if link_el is not None else ""
+
+        # Atom content can live in <content> or <summary>
+        content_el = entry.find(f"{{{ns}}}content")
+        summary_el = entry.find(f"{{{ns}}}summary")
+        body = ""
+        if content_el is not None and content_el.text:
+            body = content_el.text.strip()
+        elif summary_el is not None and summary_el.text:
+            body = summary_el.text.strip()
+
+        items.append({
+            "guid": id_el.text.strip() if id_el is not None and id_el.text else link_href,
+            "title": (entry.findtext(f"{{{ns}}}title") or "").strip(),
+            "link": link_href,
+            "published": (entry.findtext(f"{{{ns}}}published")
+                          or entry.findtext(f"{{{ns}}}updated") or "").strip(),
+            "body": body,
+        })
+    return items
+
+
+def parse_feed(xml_text: str) -> list[dict]:
+    """Parse RSS 2.0 or Atom XML into a list of item dicts."""
+    root = ET.fromstring(xml_text)
+    tag = root.tag.lower().split("}")[-1]  # strip namespace
+    if tag == "rss":
+        return _parse_rss_items(root)
+    if tag == "feed":
+        return _parse_atom_entries(root)
+    raise ValueError(f"Unknown feed format: root tag is <{root.tag}>")
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +134,30 @@ def save_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def compute_hash(date: str, title: str) -> str:
-    """Hash only date+title so body typo-fixes never re-trigger an alert."""
-    return hashlib.md5(f"{date}|{title}".encode()).hexdigest()
+# ---------------------------------------------------------------------------
+# HTTP fetch (3-attempt retry, 5 s between attempts)
+# ---------------------------------------------------------------------------
+
+_RETRY_ATTEMPTS = 3
+_RETRY_DELAY = 5  # seconds
+
+
+def fetch_feed_xml(url: str) -> str:
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _RETRY_ATTEMPTS:
+                log.warning(
+                    "Fetch attempt %d/%d failed (%s) — retrying in %ds",
+                    attempt, _RETRY_ATTEMPTS, exc, _RETRY_DELAY,
+                )
+                time.sleep(_RETRY_DELAY)
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -175,14 +165,6 @@ def compute_hash(date: str, title: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _apply_inline_styles(html: str) -> str:
-    """
-    Replace every HTML tag produced by the markdown library with an equivalent
-    tag carrying explicit inline styles.  No class names, no <style> block —
-    Gmail renders all of this correctly across all clients and platforms.
-
-    h1/h2/h3 use progressively lighter colours so the date heading (###) reads
-    as a clear sub-title beneath the masthead source name.
-    """
     replacements = [
         ("<h1>", '<h1 style="margin:0 0 14px 0;font-size:22px;font-weight:700;color:#f5f5f7;line-height:1.3;">'),
         ("<h2>", '<h2 style="margin:18px 0 8px 0;font-size:18px;font-weight:600;color:#f5f5f7;line-height:1.4;">'),
@@ -206,21 +188,38 @@ def _apply_inline_styles(html: str) -> str:
     return html
 
 
-def build_email_html(source_name: str, update: dict) -> str:
-    """
-    Build a fully inline-CSS HTML email safe for Gmail on all platforms.
+def _build_entry_block(entry: dict) -> str:
+    title = entry.get("title", "New Update")
+    link = entry.get("link", "")
+    published = entry.get("published", "")
+    body_html = _apply_inline_styles(entry.get("body", ""))
 
-    Layout
-    ──────
-    [masthead]  branded header: AI SENTINEL pill + source name
-    [card]      rendered Markdown body, which now starts with the ### Date
-                heading so the content is properly anchored
-    [footer]
-    """
-    raw_html = md_lib.markdown(update["body"], extensions=["extra", "sane_lists"])
-    body_html = _apply_inline_styles(raw_html)
+    title_html = (
+        f'<a style="color:#2997ff;text-decoration:none;font-size:20px;'
+        f'font-weight:700;line-height:1.3;" href="{link}">{title}</a>'
+        if link else
+        f'<span style="font-size:20px;font-weight:700;color:#f5f5f7;'
+        f'line-height:1.3;">{title}</span>'
+    )
 
-    # colour-scheme hints stop iOS Gmail auto-inverting the dark background
+    date_html = (
+        f'<div style="font-size:12px;color:#aeaeb2;margin-bottom:14px;'
+        f'letter-spacing:0.3px;">{published}</div>'
+        if published else ""
+    )
+
+    return (
+        f'<div style="margin-bottom:28px;padding-bottom:28px;'
+        f'border-bottom:1px solid #3a3a3c;">'
+        f'<div style="margin-bottom:6px;">{title_html}</div>'
+        f'{date_html}'
+        f'<div style="font-size:15px;color:#ebebf0;line-height:1.65;">'
+        f'{body_html}</div>'
+        f'</div>'
+    )
+
+
+def build_email_html(source_name: str, entries: list[dict]) -> str:
     head = (
         '<head>'
         '<meta charset="UTF-8">'
@@ -230,39 +229,32 @@ def build_email_html(source_name: str, update: dict) -> str:
         '</head>'
     )
 
-    # masthead — always light text on dark, explicit hex so Gmail can't guess wrong
     masthead = (
         '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
         ' style="background-color:#000000;">'
         '<tr><td style="padding:28px 24px 20px 24px;">'
-
-        # AI SENTINEL pill badge
         '<div style="display:inline-block;background-color:#0071e3;color:#ffffff;'
         'font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;'
         'padding:5px 14px;border-radius:20px;margin-bottom:14px;">'
         'AI&nbsp;SENTINEL'
         '</div>'
-
-        # source name (the "newsletter title")
         f'<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
         f'Roboto,\'Helvetica Neue\',Arial,sans-serif;font-size:28px;font-weight:700;'
         f'color:#f5f5f7;line-height:1.2;letter-spacing:-0.3px;">{source_name}</div>'
-
-        # thin divider
         '<div style="margin-top:18px;height:1px;background-color:#3a3a3c;"></div>'
-
         '</td></tr>'
         '</table>'
     )
 
-    # content card — explicit background + text colours on every wrapper
+    entry_blocks = "".join(_build_entry_block(e) for e in entries)
+
     card = (
         '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
         ' style="background-color:#1c1c1e;">'
         '<tr><td style="padding:24px 24px 32px 24px;background-color:#1c1c1e;'
         'color:#ebebf0;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
         'Roboto,\'Helvetica Neue\',Arial,sans-serif;font-size:15px;line-height:1.65;">'
-        f'{body_html}'
+        f'{entry_blocks}'
         '</td></tr>'
         '</table>'
     )
@@ -310,15 +302,21 @@ def build_email_html(source_name: str, update: dict) -> str:
 # Email sending
 # ---------------------------------------------------------------------------
 
-def send_email(source_name: str, update: dict) -> None:
+def send_email(source_name: str, entries: list[dict]) -> None:
     gmail_user = os.environ.get("GMAIL_USER")
     gmail_password = os.environ.get("GMAIL_APP_PASSWORD")
 
     if not gmail_user or not gmail_password:
         raise RuntimeError("GMAIL_USER or GMAIL_APP_PASSWORD env vars are not set")
 
-    subject = f"[AI SENTINEL] New Update: {source_name}"
-    html = build_email_html(source_name, update)
+    count = len(entries)
+    subject = (
+        f"[AI SENTINEL] {source_name}: {entries[0].get('title', 'New Update')}"
+        if count == 1
+        else f"[AI SENTINEL] {source_name}: {count} new updates"
+    )
+
+    html = build_email_html(source_name, entries)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -332,33 +330,7 @@ def send_email(source_name: str, update: dict) -> None:
         server.login(gmail_user, gmail_password)
         server.sendmail(gmail_user, RECIPIENT, msg.as_string())
 
-    log.info("Email sent for: %s", source_name)
-
-
-# ---------------------------------------------------------------------------
-# HTTP fetch  (3-attempt retry, 5 s between attempts)
-# ---------------------------------------------------------------------------
-
-_RETRY_ATTEMPTS = 3
-_RETRY_DELAY    = 5  # seconds
-
-
-def fetch_content(url: str) -> str:
-    last_exc: Exception = RuntimeError("no attempts made")
-    for attempt in range(1, _RETRY_ATTEMPTS + 1):
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
-            resp.raise_for_status()
-            return resp.text
-        except Exception as exc:
-            last_exc = exc
-            if attempt < _RETRY_ATTEMPTS:
-                log.warning(
-                    "Fetch attempt %d/%d failed (%s) — retrying in %ds",
-                    attempt, _RETRY_ATTEMPTS, exc, _RETRY_DELAY,
-                )
-                time.sleep(_RETRY_DELAY)
-    raise last_exc
+    log.info("Email sent for %s (%d entries)", source_name, count)
 
 
 # ---------------------------------------------------------------------------
@@ -371,32 +343,44 @@ def main() -> None:
     state_changed = False
 
     for source in SOURCES:
-        name       = source["name"]
-        url        = source["url"]
-        parser_key = source["parser"]
+        name = source["name"]
+        url = source["url"]
         log.info("Checking: %s", name)
 
         try:
-            content  = fetch_content(url)
-            update   = PARSERS[parser_key](content)
+            xml_text = fetch_feed_xml(url)
+            items = parse_feed(xml_text)
+            log.info("  Parsed %d item(s) from feed.", len(items))
 
-            log.info("  Extracted date : %s", update["date"])
-            log.info("  Body preview   : %.80s", update["body"].strip())
+            seen_guids = set(state.get(name, []))
+            first_run = name not in state
 
-            current_hash = compute_hash(update["date"], update["title"])
-            stored_hash  = state.get(name)
+            new_items = []
+            all_guids = set(seen_guids)
 
-            if stored_hash == current_hash:
-                log.info("  No change detected.")
+            for item in items:
+                guid = item["guid"]
+                if guid and guid not in seen_guids:
+                    new_items.append(item)
+                all_guids.add(guid)
+
+            # First run: record current GUIDs without sending emails
+            if first_run:
+                log.info("  First run — recording %d GUIDs, no emails.", len(all_guids))
+                state[name] = list(all_guids)[-MAX_STORED_GUIDS:]
+                state_changed = True
                 continue
 
-            log.info("  Change detected — sending alert email.")
-            state[name]   = current_hash
+            if not new_items:
+                log.info("  No new entries.")
+                continue
+
+            log.info("  %d new entry(ies) — sending alert.", len(new_items))
+            send_email(name, new_items)
+            state[name] = list(all_guids)[-MAX_STORED_GUIDS:]
             state_changed = True
-            send_email(name, update)
 
         except Exception as exc:
-            # Log and continue — one broken source must never block the others
             log.error("  Failed to process '%s': %s", name, exc, exc_info=True)
             continue
 
