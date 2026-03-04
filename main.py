@@ -22,12 +22,8 @@ log = logging.getLogger(__name__)
 
 SOURCES = [
     {
-        "name": "ChatGPT Release Notes",
-        "url": "https://rsshub.app/openai/chatgpt/release-notes",
-    },
-    {
         "name": "OpenAI Developer Changelog",
-        "url": "https://developers.openai.com/changelog/rss.xml",
+        "url": "https://developers.openai.com/rss.xml",
     },
     {
         "name": "OpenAI News",
@@ -367,7 +363,7 @@ def main() -> None:
             # First run: record current GUIDs without sending emails
             if first_run:
                 log.info("  First run — recording %d GUIDs, no emails.", len(all_guids))
-                state[name] = list(all_guids)[-MAX_STORED_GUIDS:]
+                state[name] = list(all_guids)
                 state_changed = True
                 continue
 
@@ -377,7 +373,7 @@ def main() -> None:
 
             log.info("  %d new entry(ies) — sending alert.", len(new_items))
             send_email(name, new_items)
-            state[name] = list(all_guids)[-MAX_STORED_GUIDS:]
+            state[name] = list(all_guids)
             state_changed = True
 
         except Exception as exc:
