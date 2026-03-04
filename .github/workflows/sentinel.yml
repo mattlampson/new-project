@@ -1,12 +1,17 @@
 name: AI Release Notes Sentinel
 
 on:
-  push:
-    branches:
-      - main
-      - "claude/*"
-  schedule:
-    - cron: "0 */4 * * *"
+  # DISABLED: Cron and push triggers disabled to stop spam emails.
+  # The Jina Reader proxy fails intermittently against Cloudflare,
+  # causing hash oscillation and ~8-9 false-positive emails/day.
+  # See: https://github.com/mattlampson/new-project/issues
+  #
+  # push:
+  #   branches:
+  #     - main
+  #     - "claude/*"
+  # schedule:
+  #   - cron: "0 */4 * * *"
   workflow_dispatch:
 
 permissions:
