@@ -42,3 +42,7 @@ The workflow triggers automatically on schedule (`0 */4 * * *`) or you can run i
 | `state.json` | Persisted GUIDs of seen items per source |
 | `requirements.txt` | Python dependency (`feedparser`) |
 | `.github/workflows/sentinel.yml` | GitHub Actions workflow definition |
+
+## Maintenance Note
+
+This project may be a candidate for future archive or removal. Do not delete it opportunistically; review and re-discuss with Codex or Claude first so the GitHub Actions workflow, repository state, and any useful release-monitoring logic can be evaluated deliberately.
