@@ -262,6 +262,10 @@ def build_email_html(source_name: str, entries: list[dict]) -> str:
         'color:#636366;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
         'Roboto,\'Helvetica Neue\',Arial,sans-serif;font-size:11px;letter-spacing:0.2px;">'
         'AI Release Notes Sentinel &mdash; checking every 4 hours'
+        '<br>'
+        '<a href="https://github.com/mattlampson/new-project/actions/workflows/sentinel.yml"'
+        ' style="color:#8e8e93;text-decoration:underline;">'
+        'Source: GitHub Actions &middot; mattlampson/new-project &middot; sentinel.yml</a>'
         '</td></tr>'
         '</table>'
     )
