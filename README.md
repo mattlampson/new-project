@@ -1,5 +1,27 @@
 # AI Release Notes Sentinel
 
+> ## ⛔ STATUS: DISABLED (2026-06-04)
+>
+> **This is the project that sends the `[AI SENTINEL] OpenAI News: …` emails to `lampsonmatt@gmail.com`.**
+> It is a **GitHub Actions cron workflow** (NOT an Apps Script). The emails go out via Python
+> `smtplib` → `smtp.gmail.com:587` using the `GMAIL_USER` + `GMAIL_APP_PASSWORD` repo secrets,
+> which is why they appear in the Gmail **Sent** folder and why `clasp` never found a script.
+>
+> The workflow was **manually disabled** on 2026-06-04 because the emails were unwanted.
+> Everything (code, history, secrets, branches) is intact — nothing was deleted.
+>
+> **Default branch is `claude/bootstrap-sentinel-project-SqmgU`, not `main`.**
+>
+> | Action | Command |
+> |--------|---------|
+> | Check status | `gh workflow list --repo mattlampson/new-project --all` |
+> | Re-enable | `gh workflow enable "AI Release Notes Sentinel" --repo mattlampson/new-project` |
+> | Disable again | `gh workflow disable "AI Release Notes Sentinel" --repo mattlampson/new-project` |
+> | Workflow page | https://github.com/mattlampson/new-project/actions/workflows/sentinel.yml |
+>
+> Every email footer now links to that workflow page (added 2026-06-04) so the source is one
+> click away if mail ever reappears.
+
 Automatically monitors AI platform release notes via RSS feeds and sends email alerts when new updates are published.
 
 ## Monitored Sources
@@ -46,3 +68,4 @@ The workflow triggers automatically on schedule (`0 */4 * * *`) or you can run i
 ## Maintenance Note
 
 This project may be a candidate for future archive or removal. Do not delete it opportunistically; review and re-discuss with Codex or Claude first so the GitHub Actions workflow, repository state, and any useful release-monitoring logic can be evaluated deliberately.
+
